@@ -2280,6 +2280,60 @@ def test_otel_certificate_env_takes_precedence_over_ssl_cert_file(
         provider.shutdown()
 
 
+class TestOpenTelemetryHeaderParsing(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("x-honeycomb-team=abc123", {"x-honeycomb-team": "abc123"}),
+            ("authorization=Bearer=a=b", {"authorization": "Bearer=a=b"}),
+            (",x-a=1,,x-b=2,", {"x-a": "1", "x-b": "2"}),
+            ("  x-a = 1 , x-b = two ", {"x-a": "1", "x-b": "two"}),
+            ("x-a=1,deadbeefsecret", {"x-a": "1"}),
+            ("deadbeefsecret", {}),
+            (MappingProxyType({"x-api-key": "secret"}), {"x-api-key": "secret"}),
+            (None, {}),
+        ]
+    )
+    def test_parses_headers(self, headers, expected):
+        self.assertEqual(OpenTelemetry._get_headers_dictionary(headers), expected)
+
+    def test_malformed_entry_is_warned_about_without_logging_its_value(self):
+        secret = "B85YgLm96superSecretIngestKey"
+        with patch("litellm._logging.verbose_logger.warning") as mock_warning:
+            OpenTelemetry._get_headers_dictionary(f"x-a=1,{secret}")
+        mock_warning.assert_called_once()
+        self.assertNotIn(secret, str(mock_warning.call_args))
+
+
+class TestOpenTelemetryConsoleFallbackGuard(unittest.TestCase):
+    def _span_processor(self, config: OpenTelemetryConfig):
+        return OpenTelemetry(config=config, tracer_provider=TracerProvider())._get_span_processor()
+
+    @parameterized.expand(
+        [
+            ({},),
+            ({"OTEL_EXPORTER": "", "OTEL_EXPORTER_OTLP_PROTOCOL": "", "OTEL_ENDPOINT": ""},),
+        ]
+    )
+    def test_no_exporter_and_no_endpoint_disables_export(self, env):
+        from opentelemetry.sdk.trace import SpanProcessor
+
+        with patch.dict(os.environ, env, clear=True):
+            config = OpenTelemetryConfig.from_env()
+        self.assertEqual(config.exporter, "none")
+        self.assertIs(type(self._span_processor(config)), SpanProcessor)
+
+    @patch.dict(os.environ, {"OTEL_EXPORTER": "console"}, clear=True)
+    def test_explicit_console_still_prints_spans(self):
+        from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+        processor = self._span_processor(OpenTelemetryConfig.from_env())
+        self.assertIsInstance(processor.span_exporter, ConsoleSpanExporter)
+
+    @patch.dict(os.environ, {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318"}, clear=True)
+    def test_endpoint_without_exporter_uses_otlp_http(self):
+        self.assertEqual(OpenTelemetryConfig.from_env().exporter, "otlp_http")
+
+
 class TestOpenTelemetryProtocolSelection(unittest.TestCase):
     """Test suite for verifying correct exporter selection based on protocol"""
 

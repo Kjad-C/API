@@ -367,8 +367,12 @@ class OpenTelemetryConfig:
             InMemorySpanExporter,
         )
 
-        exporter: Final = os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", os.getenv("OTEL_EXPORTER", "console"))
-        endpoint: Final = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", os.getenv("OTEL_ENDPOINT"))
+        endpoint: Final = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or os.getenv("OTEL_ENDPOINT")
+        exporter: Final = (
+            os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
+            or os.getenv("OTEL_EXPORTER")
+            or ("console" if endpoint else "none")
+        )
         headers: Final = os.getenv(
             "OTEL_EXPORTER_OTLP_HEADERS", os.getenv("OTEL_HEADERS")
         )  # example: OTEL_HEADERS=x-honeycomb-team=B85YgLm96***"
@@ -3083,6 +3087,15 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             )
             return SimpleSpanProcessor(cast(SpanExporter, otel_exporter))
 
+        if otel_exporter == "none":
+            from opentelemetry.sdk.trace import SpanProcessor
+
+            verbose_logger.warning(
+                "OpenTelemetry: no OTEL exporter or endpoint is set, so trace export is disabled. "
+                "Set an endpoint, or set OTEL_EXPORTER=console to print spans to stdout."
+            )
+            return SpanProcessor()
+
         if otel_exporter == "console":
             verbose_logger.debug(
                 "OpenTelemetry: intiializing console exporter. Value of OTEL_EXPORTER: %s",
@@ -3370,24 +3383,16 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
         return endpoint
 
     @staticmethod
-    def _get_headers_dictionary(
-        headers: "str | Mapping[str, str] | None",
-    ) -> dict[str, str]:
-        """
-        Convert a string or dictionary of headers into a dictionary of headers.
-        """
-        _split_otel_headers: dict[str, str] = {}
-        if headers:
-            if isinstance(headers, str):
-                # when passed HEADERS="x-honeycomb-team=B85YgLm96******"
-                # Split only on first '=' occurrence
-                parts: Final = headers.split(",")
-                for part in parts:
-                    key, value = part.split("=", 1)
-                    _split_otel_headers[key] = value
-            elif isinstance(headers, Mapping):
-                _split_otel_headers.update(headers)
-        return _split_otel_headers
+    def _get_headers_dictionary(headers: "str | Mapping[str, str] | None") -> dict[str, str]:
+        if not isinstance(headers, str):
+            return dict(headers or {})
+        entries: Final = headers.split(",")
+        if any(entry.strip() and "=" not in entry for entry in entries):
+            verbose_logger.warning(
+                "OpenTelemetry: skipped an OTEL_HEADERS entry without '='. Its value is not logged since it may be a secret"
+            )
+        pairs: Final = (entry.split("=", 1) for entry in entries if "=" in entry)
+        return {key.strip(): value.strip() for key, value in pairs}
 
     async def async_management_endpoint_success_hook(
         self,
