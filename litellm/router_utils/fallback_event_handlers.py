@@ -8,12 +8,14 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
+from pydantic import TypeAdapter
 
 import litellm
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
@@ -49,6 +51,7 @@ else:
 # (e.g. a nonexistent file/batch/thread id), independent of the selected deployment's health.
 _REQUEST_SCOPED_STATUS_CODES: Final = frozenset((404,))
 _NO_MODEL_CALL_DETAILS: Final[Mapping[str, object]] = MappingProxyType({})
+_FALLBACK_KWARGS_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
 def _trigger_cooldown_for_failed_deployment(
@@ -436,6 +439,22 @@ def mid_stream_retry_kwargs(
     the controls carrier the snapshot still holds restores the overrides into the retry's own hop.
     """
     return {key: value for key, value in hop_kwargs.items() if key not in _MID_STREAM_RETRY_STRIPPED_KEYS}
+
+
+def discard_superseded_attempt_usage(kwargs: Mapping[str, object]) -> None:
+    """The next attempt of this request is about to open. A stream the previous attempt dropped stashed the
+    usage it consumed on the request's logging object for its own failure log and for the failure row of a
+    request that runs out of attempts; the next attempt's log must carry its own usage instead."""
+    logging_obj: Final = kwargs.get("litellm_logging_obj")
+    if isinstance(logging_obj, Logging):
+        logging_obj.discard_partial_usage_for_failure()
+
+
+def _failure_callbacks_blocked_logging_object(kwargs: Mapping[str, object]) -> Logging | None:
+    logging_obj: Final = kwargs.get("litellm_logging_obj")
+    if not isinstance(logging_obj, Logging):
+        return None
+    return logging_obj if logging_obj.model_call_details.get("has_logged_async_failure", False) is True else None
 
 
 def _request_metadata_bucket(kwargs: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -836,6 +855,9 @@ async def run_async_fallback(
                 )
                 continue
             attempted.record(attempt_key)
+        failure_callbacks_blocked_logging_obj = _failure_callbacks_blocked_logging_object(
+            _FALLBACK_KWARGS_ADAPTER.validate_python(kwargs)
+        )
         try:
             # LOGGING
             kwargs = litellm_router.log_retry(kwargs=kwargs, e=original_exception)
@@ -859,6 +881,7 @@ async def run_async_fallback(
             kwargs["attempted_targets"] = attempted
             if include_fallback_errors:
                 kwargs["include_fallback_errors"] = include_fallback_errors
+            discard_superseded_attempt_usage(_FALLBACK_KWARGS_ADAPTER.validate_python(kwargs))
             response = await litellm_router.async_function_with_fallbacks(*args, **kwargs)
             verbose_router_logger.info("Successful fallback b/w models.")
             response = add_fallback_headers_to_response(
@@ -881,13 +904,12 @@ async def run_async_fallback(
                 kwargs=kwargs,
                 original_exception=original_exception,
             )
-            logging_obj = kwargs.get("litellm_logging_obj")
-            if logging_obj is not None and logging_obj.model_call_details.get("has_logged_async_failure", False):
+            if failure_callbacks_blocked_logging_obj is not None:
                 _trigger_cooldown_for_failed_deployment(
                     litellm_router=litellm_router,
                     kwargs=kwargs,
                     exception=e,
-                    model_call_details=logging_obj.model_call_details,
+                    model_call_details=failure_callbacks_blocked_logging_obj.model_call_details,
                 )
     raise error_from_fallbacks
 

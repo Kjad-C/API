@@ -2154,12 +2154,7 @@ class CustomStreamWrapper:
             traceback_exception = traceback.format_exc()
             ## ADD DEBUG INFORMATION - E.G. LITELLM REQUEST TIMEOUT
             traceback_exception += f"\nLiteLLM Default Request Timeout - {litellm.request_timeout}"
-            if self.logging_obj is not None:
-                self._record_partial_usage_for_failure()
-                ## LOGGING
-                self._failure_logging = asyncio.create_task(
-                    self.logging_obj.dispatch_failure_handlers(e, traceback_exception, prefer_async_handlers=True)
-                )
+            self._dispatch_stream_failure(e, traceback_exception)
             await self.aclose()
             self._handle_stream_fallback_error(e)
         except (httpx.ReadError, httpx.RemoteProtocolError) as e:
@@ -2286,14 +2281,17 @@ class CustomStreamWrapper:
             return processed_chunk
 
     def _log_stream_failure_and_raise(self, e: Exception) -> NoReturn:
-        traceback_exception: Final = traceback.format_exc()
-        if self.logging_obj is not None:
-            self._record_partial_usage_for_failure()
-            ## LOGGING
-            self._failure_logging = asyncio.create_task(
-                self.logging_obj.dispatch_failure_handlers(e, traceback_exception, prefer_async_handlers=True)
-            )
+        self._dispatch_stream_failure(e, traceback.format_exc())
         self._handle_stream_fallback_error(e)
+
+    def _dispatch_stream_failure(self, e: Exception, traceback_exception: str) -> None:
+        if self.logging_obj is None:
+            return
+        self._record_partial_usage_for_failure()
+        attempt_logging_obj: Final = self.logging_obj.attempt_scoped_copy()
+        self._failure_logging = asyncio.create_task(
+            attempt_logging_obj.dispatch_failure_handlers(e, traceback_exception, prefer_async_handlers=True)
+        )
 
     async def wait_for_failure_logging(self, timeout: float) -> None:
         """Let this stream's failure log read its own deployment before a fallback reuses the logging object."""
@@ -2306,9 +2304,9 @@ class CustomStreamWrapper:
         A stream that breaks mid-flight still billed the provider for the chunks
         already delivered. Recover that partial usage from the chunks seen so
         far and stash it, with its cost, on the logging object so the failure
-        handler records the real partial spend instead of zero. A request that
-        later recovers via a router fallback overwrites this with the combined
-        success log on the same request id, so this never double counts.
+        handler records the real partial spend instead of zero. The router
+        discards the stash right before it opens the next attempt, so a request
+        that later recovers via a fallback logs that hop's own usage.
         """
         if self.logging_obj is None or not self.chunks:
             return

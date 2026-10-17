@@ -237,6 +237,7 @@ from litellm.router_utils.fallback_event_handlers import (
     clear_pre_routing_selection,
     committed_retry_budget_for_request,
     continuation_fallback_targets,
+    discard_superseded_attempt_usage,
     fallback_lookup_groups,
     fallback_target_name,
     fallback_target_overrides_request_params,
@@ -6162,6 +6163,7 @@ class Router:
                 for buffered_chunk in buffered_lifecycle_chunks:
                     yield buffered_chunk
             except Exception as stream_error:  # noqa: BLE001  # any raised provider error must reach the fallback gate
+                await close_source()
                 async for item in self._aanthropic_messages_recover_stream_error(
                     stream_error,
                     has_generated_content,
@@ -6405,6 +6407,7 @@ class Router:
             verbose_router_logger.debug(
                 "Retrying stream that failed before content, attempt %s of %s", attempt + 1, budget
             )
+            discard_superseded_attempt_usage(retry_kwargs)
             try:
                 response = await attempt_function(**retry_kwargs)
             except Exception as retry_error:  # noqa: BLE001  # the fallback chain judges the failed retry
