@@ -1390,6 +1390,7 @@ def _dispatch_success_logging(
         result=result,
         start_time=start_time,
         end_time=end_time,
+        async_handler_runs=not is_completion_with_fallbacks,
     )
 
 
@@ -2284,7 +2285,7 @@ def client(original_function):
                 unbind_budget_reservation_from_callbacks(logging_obj.litellm_params)
                 try:
                     logging_obj.failure_handler(
-                        e, traceback_exception, start_time, end_time
+                        e, traceback_exception, start_time, end_time, for_async_request=True
                     )  # DO NOT MAKE THREADED - router retry fallback relies on this!
                 except Exception as e:
                     raise e
